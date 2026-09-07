@@ -152,10 +152,15 @@ fn segments_with(table_base: u64, ps5: bool) -> (Vec<u8>, Vec<u8>) {
     } else {
         (DT_SCE_STRTAB, DT_SCE_STRSZ)
     };
-    let (t_module_info, t_needed_module, t_import_lib) = if ps5 {
-        (0x6100_0043, 0x6100_0045, 0x6100_0049)
+    let (t_module_info, t_needed_module, t_export_lib, t_import_lib) = if ps5 {
+        (0x6100_0043, 0x6100_0045, 0x6100_0047, 0x6100_0049)
     } else {
-        (DT_SCE_MODULE_INFO, DT_SCE_NEEDED_MODULE, DT_SCE_IMPORT_LIB)
+        (
+            DT_SCE_MODULE_INFO,
+            DT_SCE_NEEDED_MODULE,
+            DT_SCE_EXPORT_LIB,
+            DT_SCE_IMPORT_LIB,
+        )
     };
 
     let mut dynamic = Vec::new();
@@ -178,15 +183,7 @@ fn segments_with(table_base: u64, ps5: bool) -> (Vec<u8>, Vec<u8>) {
         t_needed_module,
         module_value(libkernel, 0, 0, 0),
     );
-    if !ps5 {
-        // No PS5 export-library tag has been observed to verify against, so
-        // the fixture doesn't invent one.
-        dyn_entry(
-            &mut dynamic,
-            DT_SCE_EXPORT_LIB,
-            library_value(this_lib, 1, 1),
-        );
-    }
+    dyn_entry(&mut dynamic, t_export_lib, library_value(this_lib, 1, 1));
     dyn_entry(&mut dynamic, t_import_lib, library_value(libkernel, 1, 0));
     // Deliberately last, to prove the reader doesn't depend on seeing the
     // string table before the tags that index into it.
@@ -559,13 +556,9 @@ fn reads_the_ps5_dynamic_layout() {
     // names, same tables, only the addressing differs.
     assert_eq!(image.imports().unwrap(), vec![expected_import()]);
 
-    // No PS5 export-library tag is decoded, so an export's library falls back
-    // to its encoded id. Its module still resolves, via the module-info tag.
-    let exports = image.exports().unwrap();
-    assert_eq!(exports.len(), 1);
-    assert_eq!(exports[0].nid, EXPORT_NID);
-    assert_eq!(exports[0].module, "myModule");
-    assert_eq!(exports[0].library, "B");
+    // Exports resolve fully too, now that PS5's export-library tag is known.
+    assert_eq!(image.exports().unwrap(), vec![expected_export()]);
+    assert_eq!(dynamic.export_libs[0].name, "myLib");
 }
 
 #[test]
@@ -586,6 +579,7 @@ fn ps5_tag_spellings_canonicalise_onto_the_ps4_ones() {
         DynTag::from(0x6100_0045).canonical(),
         DynTag::SceNeededModule
     );
+    assert_eq!(DynTag::from(0x6100_0047).canonical(), DynTag::SceExportLib);
     assert_eq!(DynTag::from(0x6100_0049).canonical(), DynTag::SceImportLib);
     // The PS4 spellings are already canonical.
     assert_eq!(DynTag::from(0x6100_0035).canonical(), DynTag::SceStrTab);

@@ -78,12 +78,14 @@ pub enum DynTag {
     SymEnt,
     PltRel,
     JmpRel,
-    // PS5 respells four of the SCE tags. Verified against a retail PS5
-    // eboot.bin: same field packing as their PS4 counterparts, different
-    // constants. `DT_SCE_IMPORT_LIB_ATTR` keeps its PS4 value.
+    // PS5 respells five of the SCE tags. Verified against a retail PS5
+    // eboot.bin and a libc.prx from the same title: same field packing as
+    // their PS4 counterparts, different constants.
+    // `DT_SCE_IMPORT_LIB_ATTR` keeps its PS4 value.
     Ps5OriginalFilename,
     Ps5ModuleInfo,
     Ps5NeededModule,
+    Ps5ExportLib,
     Ps5ImportLib,
     Other(i64),
 }
@@ -141,6 +143,7 @@ impl From<i64> for DynTag {
             0x6100_0041 => Self::Ps5OriginalFilename,
             0x6100_0043 => Self::Ps5ModuleInfo,
             0x6100_0045 => Self::Ps5NeededModule,
+            0x6100_0047 => Self::Ps5ExportLib,
             0x6100_0049 => Self::Ps5ImportLib,
             other => Self::Other(other),
         }
@@ -174,6 +177,7 @@ impl DynTag {
             Self::Ps5OriginalFilename => Self::SceOriginalFilename,
             Self::Ps5ModuleInfo => Self::SceModuleInfo,
             Self::Ps5NeededModule => Self::SceNeededModule,
+            Self::Ps5ExportLib => Self::SceExportLib,
             Self::Ps5ImportLib => Self::SceImportLib,
             other => other,
         }
