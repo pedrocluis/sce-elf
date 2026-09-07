@@ -86,6 +86,15 @@ fn library_value(name_offset: u32, version: u16, id: u16) -> u64 {
 /// The image exports `EXPORT_NID` from `myModule`'s `myLib` (id 1, so the
 /// encoded id is `B`) and imports `IMPORT_NID` from `libkernel` (id 0, `A`).
 fn segments() -> (Vec<u8>, Vec<u8>) {
+    segments_with(0, false)
+}
+
+/// `table_base` is added to every table address written into the dynamic
+/// array — 0 for the PS4 layout, where they are offsets into
+/// `PT_SCE_DYNLIBDATA`, or the tables' virtual address for the PS5 layout.
+/// `ps5` selects the standard ELF tag spellings and PS5's module/library
+/// tag constants.
+fn segments_with(table_base: u64, ps5: bool) -> (Vec<u8>, Vec<u8>) {
     let mut strtab = StrTab::new();
     let this_module = strtab.add("myModule");
     let this_lib = strtab.add("myLib");
@@ -123,39 +132,66 @@ fn segments() -> (Vec<u8>, Vec<u8>) {
     let jmprel_size = jmprel.len() as u64;
     dynlibdata.extend_from_slice(&jmprel);
 
+    // PS5 spells the table tags the standard ELF way and gives the module
+    // and library entries their own constants; the packing is identical.
+    let (t_symtab, t_syment, t_rela, t_relasz, t_relaent, t_jmprel, t_pltrelsz) = if ps5 {
+        (0x6, 0xb, 0x7, 0x8, 0x9, 0x17, 0x2)
+    } else {
+        (
+            DT_SCE_SYMTAB,
+            DT_SCE_SYMENT,
+            DT_SCE_RELA,
+            DT_SCE_RELASZ,
+            DT_SCE_RELAENT,
+            DT_SCE_JMPREL,
+            DT_SCE_PLTRELSZ,
+        )
+    };
+    let (t_strtab, t_strsz) = if ps5 {
+        (0x5, 0xa)
+    } else {
+        (DT_SCE_STRTAB, DT_SCE_STRSZ)
+    };
+    let (t_module_info, t_needed_module, t_import_lib) = if ps5 {
+        (0x6100_0043, 0x6100_0045, 0x6100_0049)
+    } else {
+        (DT_SCE_MODULE_INFO, DT_SCE_NEEDED_MODULE, DT_SCE_IMPORT_LIB)
+    };
+
     let mut dynamic = Vec::new();
-    dyn_entry(&mut dynamic, DT_SCE_SYMTAB, symtab_offset);
+    dyn_entry(&mut dynamic, t_symtab, table_base + symtab_offset);
+    // PS5 keeps DT_SCE_SYMTABSZ: standard ELF has no symbol-table-size tag.
     dyn_entry(&mut dynamic, DT_SCE_SYMTABSZ, symtab_size);
-    dyn_entry(&mut dynamic, DT_SCE_SYMENT, 24);
-    dyn_entry(&mut dynamic, DT_SCE_RELA, rela_offset);
-    dyn_entry(&mut dynamic, DT_SCE_RELASZ, rela_size);
-    dyn_entry(&mut dynamic, DT_SCE_RELAENT, 24);
-    dyn_entry(&mut dynamic, DT_SCE_JMPREL, jmprel_offset);
-    dyn_entry(&mut dynamic, DT_SCE_PLTRELSZ, jmprel_size);
+    dyn_entry(&mut dynamic, t_syment, 24);
+    dyn_entry(&mut dynamic, t_rela, table_base + rela_offset);
+    dyn_entry(&mut dynamic, t_relasz, rela_size);
+    dyn_entry(&mut dynamic, t_relaent, 24);
+    dyn_entry(&mut dynamic, t_jmprel, table_base + jmprel_offset);
+    dyn_entry(&mut dynamic, t_pltrelsz, jmprel_size);
     dyn_entry(
         &mut dynamic,
-        DT_SCE_MODULE_INFO,
+        t_module_info,
         module_value(this_module, 1, 2, 1),
     );
     dyn_entry(
         &mut dynamic,
-        DT_SCE_NEEDED_MODULE,
+        t_needed_module,
         module_value(libkernel, 0, 0, 0),
     );
-    dyn_entry(
-        &mut dynamic,
-        DT_SCE_EXPORT_LIB,
-        library_value(this_lib, 1, 1),
-    );
-    dyn_entry(
-        &mut dynamic,
-        DT_SCE_IMPORT_LIB,
-        library_value(libkernel, 1, 0),
-    );
+    if !ps5 {
+        // No PS5 export-library tag has been observed to verify against, so
+        // the fixture doesn't invent one.
+        dyn_entry(
+            &mut dynamic,
+            DT_SCE_EXPORT_LIB,
+            library_value(this_lib, 1, 1),
+        );
+    }
+    dyn_entry(&mut dynamic, t_import_lib, library_value(libkernel, 1, 0));
     // Deliberately last, to prove the reader doesn't depend on seeing the
     // string table before the tags that index into it.
-    dyn_entry(&mut dynamic, DT_SCE_STRTAB, 0);
-    dyn_entry(&mut dynamic, DT_SCE_STRSZ, symtab_offset);
+    dyn_entry(&mut dynamic, t_strtab, table_base);
+    dyn_entry(&mut dynamic, t_strsz, symtab_offset);
     dyn_entry(&mut dynamic, DT_NULL, 0);
     // Trailing junk after DT_NULL, which a real image has as padding.
     dyn_entry(&mut dynamic, DT_SCE_STRSZ, 0xdead_beef);
@@ -478,4 +514,80 @@ fn compat_report_counts_unimplemented_imports() {
     assert_eq!(report.missing_count(), 0);
     assert_eq!(report.implemented(), 1);
     assert_eq!(report.coverage(), 1.0);
+}
+
+/// A PS5-shaped image: no `PT_SCE_DYNLIBDATA` at all, standard `DT_*` tags
+/// holding virtual addresses, and the tables sitting inside a `PT_LOAD`.
+fn ps5_elf() -> Vec<u8> {
+    const TABLES_VADDR: u64 = 0x20_0000;
+    let (dynamic, tables) = segments_with(TABLES_VADDR, true);
+    let load_at = 256u64;
+    let dynamic_at = 2048u64;
+
+    let mut file = elf_header(64, 2);
+    file.extend(program_header_at(
+        PT_LOAD,
+        load_at,
+        tables.len() as u64,
+        TABLES_VADDR,
+    ));
+    file.extend(program_header(PT_DYNAMIC, dynamic_at, dynamic.len() as u64));
+    file.resize(load_at as usize, 0);
+    file.extend_from_slice(&tables);
+    file.resize(dynamic_at as usize, 0);
+    file.extend_from_slice(&dynamic);
+    file
+}
+
+#[test]
+fn reads_the_ps5_dynamic_layout() {
+    let image = Image::parse(ps5_elf()).unwrap();
+    assert!(
+        image.segment_index(ProgramType::SceDynlibData).is_none(),
+        "the PS5 layout has no PT_SCE_DYNLIBDATA"
+    );
+
+    let dynamic = image.dynamic().unwrap();
+    assert_eq!(dynamic.symbols.len(), 4);
+    assert_eq!(dynamic.relocations.len(), 3);
+    assert_eq!(dynamic.plt_relocations.len(), 1);
+    assert_eq!(dynamic.export_modules[0].name, "myModule");
+    assert_eq!(dynamic.import_modules[0].name, "libkernel");
+    assert_eq!(dynamic.import_libs[0].name, "libkernel");
+
+    // Imports decode exactly as they do on PS4 — same NID#library#module
+    // names, same tables, only the addressing differs.
+    assert_eq!(image.imports().unwrap(), vec![expected_import()]);
+
+    // No PS5 export-library tag is decoded, so an export's library falls back
+    // to its encoded id. Its module still resolves, via the module-info tag.
+    let exports = image.exports().unwrap();
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0].nid, EXPORT_NID);
+    assert_eq!(exports[0].module, "myModule");
+    assert_eq!(exports[0].library, "B");
+}
+
+#[test]
+fn ps5_tag_spellings_canonicalise_onto_the_ps4_ones() {
+    use sce_elf::DynTag;
+    // The standard ELF spellings PS5 uses for the tables.
+    assert_eq!(DynTag::from(0x5).canonical(), DynTag::SceStrTab);
+    assert_eq!(DynTag::from(0x6).canonical(), DynTag::SceSymTab);
+    assert_eq!(DynTag::from(0x7).canonical(), DynTag::SceRela);
+    assert_eq!(DynTag::from(0x17).canonical(), DynTag::SceJmpRel);
+    // PS5's own module and library constants.
+    assert_eq!(
+        DynTag::from(0x6100_0041).canonical(),
+        DynTag::SceOriginalFilename
+    );
+    assert_eq!(DynTag::from(0x6100_0043).canonical(), DynTag::SceModuleInfo);
+    assert_eq!(
+        DynTag::from(0x6100_0045).canonical(),
+        DynTag::SceNeededModule
+    );
+    assert_eq!(DynTag::from(0x6100_0049).canonical(), DynTag::SceImportLib);
+    // The PS4 spellings are already canonical.
+    assert_eq!(DynTag::from(0x6100_0035).canonical(), DynTag::SceStrTab);
+    assert_eq!(DynTag::from(0x6100_0015).canonical(), DynTag::SceImportLib);
 }

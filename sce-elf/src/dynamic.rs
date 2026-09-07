@@ -64,6 +64,27 @@ pub enum DynTag {
     SceStrSz,
     SceSymTab,
     SceSymTabSz,
+    // The standard ELF spellings. PS4 images use the `DT_SCE_*` tags above
+    // and these never appear; PS5 images use these instead, holding virtual
+    // addresses rather than `PT_SCE_DYNLIBDATA` offsets.
+    PltRelSz,
+    PltGot,
+    Hash,
+    StrTab,
+    SymTab,
+    RelaSz,
+    RelaEnt,
+    StrSz,
+    SymEnt,
+    PltRel,
+    JmpRel,
+    // PS5 respells four of the SCE tags. Verified against a retail PS5
+    // eboot.bin: same field packing as their PS4 counterparts, different
+    // constants. `DT_SCE_IMPORT_LIB_ATTR` keeps its PS4 value.
+    Ps5OriginalFilename,
+    Ps5ModuleInfo,
+    Ps5NeededModule,
+    Ps5ImportLib,
     Other(i64),
 }
 
@@ -106,7 +127,55 @@ impl From<i64> for DynTag {
             0x6100_0037 => Self::SceStrSz,
             0x6100_0039 => Self::SceSymTab,
             0x6100_003f => Self::SceSymTabSz,
+            0x2 => Self::PltRelSz,
+            0x3 => Self::PltGot,
+            0x4 => Self::Hash,
+            0x5 => Self::StrTab,
+            0x6 => Self::SymTab,
+            0x8 => Self::RelaSz,
+            0x9 => Self::RelaEnt,
+            0xa => Self::StrSz,
+            0xb => Self::SymEnt,
+            0x14 => Self::PltRel,
+            0x17 => Self::JmpRel,
+            0x6100_0041 => Self::Ps5OriginalFilename,
+            0x6100_0043 => Self::Ps5ModuleInfo,
+            0x6100_0045 => Self::Ps5NeededModule,
+            0x6100_0049 => Self::Ps5ImportLib,
             other => Self::Other(other),
+        }
+    }
+}
+
+impl DynTag {
+    /// Collapses the spellings that mean the same thing onto one variant, so
+    /// a reader can match a single set of tags across PS4 and PS5 images.
+    ///
+    /// PS4 uses Sony's `DT_SCE_*` tags; PS5 uses the standard ELF ones for
+    /// the tables and its own constants for the module and library entries.
+    /// The `DT_SCE_*` variant is the representative in every case — what
+    /// differs between the two is only where the value points (a
+    /// `PT_SCE_DYNLIBDATA` offset vs. a virtual address), which is the
+    /// [`TableSource`]'s business, not the tag's.
+    pub fn canonical(self) -> Self {
+        match self {
+            Self::StrTab => Self::SceStrTab,
+            Self::StrSz => Self::SceStrSz,
+            Self::SymTab => Self::SceSymTab,
+            Self::SymEnt => Self::SceSymEnt,
+            Self::Hash => Self::SceHash,
+            Self::Rela => Self::SceRela,
+            Self::RelaSz => Self::SceRelaSz,
+            Self::RelaEnt => Self::SceRelaEnt,
+            Self::JmpRel => Self::SceJmpRel,
+            Self::PltRel => Self::ScePltRel,
+            Self::PltRelSz => Self::ScePltRelSz,
+            Self::PltGot => Self::ScePltGot,
+            Self::Ps5OriginalFilename => Self::SceOriginalFilename,
+            Self::Ps5ModuleInfo => Self::SceModuleInfo,
+            Self::Ps5NeededModule => Self::SceNeededModule,
+            Self::Ps5ImportLib => Self::SceImportLib,
+            other => other,
         }
     }
 }
@@ -265,8 +334,40 @@ pub struct DynSymbol {
     pub kind: u8,
 }
 
-/// The contents of `PT_DYNAMIC`, with every `DT_SCE_*` table it points at
-/// resolved against `PT_SCE_DYNLIBDATA`.
+/// Where the string, symbol and relocation tables actually live.
+///
+/// The two layouts differ only in what a tag's value means. PS4 images put
+/// the tables in `PT_SCE_DYNLIBDATA` and the `DT_SCE_*` tags hold offsets
+/// into it ([`DynlibData`]). PS5 images use the standard `DT_*` tags holding
+/// virtual addresses, with the tables sitting inside ordinary `PT_LOAD`
+/// segments (`Image` implements this).
+pub trait TableSource {
+    /// The `size` bytes a tag's value points at. `what` names the tag, for
+    /// error messages.
+    fn slice(&self, what: &'static str, at: u64, size: u64) -> Result<&[u8]>;
+}
+
+/// A `PT_SCE_DYNLIBDATA` blob: tag values are byte offsets into it.
+pub struct DynlibData<'a>(pub &'a [u8]);
+
+impl TableSource for DynlibData<'_> {
+    fn slice(&self, what: &'static str, at: u64, size: u64) -> Result<&[u8]> {
+        let limit = self.0.len() as u64;
+        match at.checked_add(size) {
+            Some(end) if end <= limit => Ok(&self.0[at as usize..end as usize]),
+            _ => Err(Error::OutOfBounds {
+                what,
+                region: "PT_SCE_DYNLIBDATA",
+                offset: at,
+                size,
+                limit,
+            }),
+        }
+    }
+}
+
+/// The contents of `PT_DYNAMIC`, with every table it points at resolved
+/// through a [`TableSource`].
 #[derive(Debug, Clone, Default)]
 pub struct Dynamic {
     /// Every entry up to (not including) the terminating `DT_NULL`.
@@ -297,8 +398,17 @@ pub struct Dynamic {
 
 impl Dynamic {
     /// Parses the `PT_DYNAMIC` entry array, resolving its `DT_SCE_*` offsets
-    /// against the `PT_SCE_DYNLIBDATA` blob.
+    /// against the `PT_SCE_DYNLIBDATA` blob. This is the PS4 layout; see
+    /// [`Dynamic::parse_from`] for the general form.
     pub fn parse(dynamic: &[u8], dynlibdata: &[u8]) -> Result<Self> {
+        Self::parse_from(dynamic, &DynlibData(dynlibdata))
+    }
+
+    /// Parses the `PT_DYNAMIC` entry array, reading the tables it points at
+    /// through `source`. Handles both the PS4 and PS5 layouts, since
+    /// [`DynTag::canonical`] collapses their spellings and the `TableSource`
+    /// absorbs the difference in what the values address.
+    pub fn parse_from(dynamic: &[u8], source: &dyn TableSource) -> Result<Self> {
         let entries = read_entries(dynamic)?;
 
         // Two passes: the module/library/filename tags name themselves by
@@ -315,7 +425,7 @@ impl Dynamic {
         let mut jmprel_off = None;
         let mut jmprel_sz = None;
         for entry in &entries {
-            match DynTag::from(entry.d_tag) {
+            match DynTag::from(entry.d_tag).canonical() {
                 DynTag::SceStrTab => str_off = Some(entry.d_val),
                 DynTag::SceStrSz => str_sz = Some(entry.d_val),
                 DynTag::SceSymTab => sym_off = Some(entry.d_val),
@@ -331,9 +441,7 @@ impl Dynamic {
         }
 
         let str_table = match (str_off, str_sz) {
-            (Some(offset), Some(size)) => {
-                sub_slice(dynlibdata, "DT_SCE_STRTAB", offset, size)?.to_vec()
-            }
+            (Some(offset), Some(size)) => source.slice("STRTAB", offset, size)?.to_vec(),
             _ => Vec::new(),
         };
 
@@ -347,7 +455,7 @@ impl Dynamic {
                         minimum: SYMBOL_SIZE,
                     });
                 }
-                let bytes = sub_slice(dynlibdata, "DT_SCE_SYMTAB", offset, size)?;
+                let bytes = source.slice("SYMTAB", offset, size)?;
                 let mut cursor = Cursor::new(bytes);
                 (0..size / stride)
                     .map(|i| {
@@ -364,15 +472,11 @@ impl Dynamic {
         // shadPS4 has ever seen in the wild.
         let stride = rela_ent.unwrap_or(RELOCATION_SIZE);
         let relocations = match (rela_off, rela_sz) {
-            (Some(offset), Some(size)) => {
-                read_relocations(dynlibdata, "DT_SCE_RELA", offset, size, stride)?
-            }
+            (Some(offset), Some(size)) => read_relocations(source, "RELA", offset, size, stride)?,
             _ => Vec::new(),
         };
         let plt_relocations = match (jmprel_off, jmprel_sz) {
-            (Some(offset), Some(size)) => {
-                read_relocations(dynlibdata, "DT_SCE_JMPREL", offset, size, stride)?
-            }
+            (Some(offset), Some(size)) => read_relocations(source, "JMPREL", offset, size, stride)?,
             _ => Vec::new(),
         };
 
@@ -385,7 +489,7 @@ impl Dynamic {
         };
 
         for entry in &entries {
-            match DynTag::from(entry.d_tag) {
+            match DynTag::from(entry.d_tag).canonical() {
                 DynTag::Needed => this.needed.push(this.string(entry.d_val)?),
                 DynTag::SceOriginalFilename => {
                     this.original_filename = Some(this.string(entry.d_val)?);
@@ -531,7 +635,7 @@ fn read_entries(dynamic: &[u8]) -> Result<Vec<DynEntry>> {
 }
 
 fn read_relocations(
-    dynlibdata: &[u8],
+    source: &dyn TableSource,
     what: &'static str,
     offset: u64,
     size: u64,
@@ -544,7 +648,7 @@ fn read_relocations(
             minimum: RELOCATION_SIZE,
         });
     }
-    let bytes = sub_slice(dynlibdata, what, offset, size)?;
+    let bytes = source.slice(what, offset, size)?;
     let mut cursor = Cursor::new(bytes);
     (0..size / stride)
         .map(|i| {
@@ -552,26 +656,6 @@ fn read_relocations(
             Ok(Relocation::read(&mut cursor)?)
         })
         .collect()
-}
-
-fn sub_slice<'a>(
-    dynlibdata: &'a [u8],
-    what: &'static str,
-    offset: u64,
-    size: u64,
-) -> Result<&'a [u8]> {
-    let end = offset.checked_add(size);
-    let limit = dynlibdata.len() as u64;
-    match end {
-        Some(end) if end <= limit => Ok(&dynlibdata[offset as usize..end as usize]),
-        _ => Err(Error::OutOfBounds {
-            what,
-            region: "PT_SCE_DYNLIBDATA",
-            offset,
-            size,
-            limit,
-        }),
-    }
 }
 
 fn string_at(str_table: &[u8], offset: u64) -> Result<String> {
