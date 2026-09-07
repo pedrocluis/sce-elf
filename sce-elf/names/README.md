@@ -36,6 +36,21 @@ reproduced.
 If you would rather not ship this list, delete `sce.txt` — the crate builds
 fine with any subset of these files, including none.
 
+## Getting much better coverage
+
+The bundled lists are deliberately small. For real work, point the tool at a
+large corpus you obtain yourself — `sharpemu/sharpemu` carries a
+`scripts/ps5_names.txt` of ~154k PS5 symbol names, which is not vendored here
+(that repo is GPL-2.0, and the list itself is scraped from an unlicensed
+source) but works fine as a runtime wordlist:
+
+```sh
+nidscan eboot.bin --names path/to/ps5_names.txt
+```
+
+On a retail PS5 title that takes naming from 431 of 1747 imports to 1738 —
+about 99%. Loading it costs roughly 0.2s.
+
 ## Adding your own
 
 Point `SCE_NID_NAMES` at extra newline-delimited wordlists (`:`-separated) to

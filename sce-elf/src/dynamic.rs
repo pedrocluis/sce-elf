@@ -82,11 +82,20 @@ pub enum DynTag {
     // eboot.bin and a libc.prx from the same title: same field packing as
     // their PS4 counterparts, different constants.
     // `DT_SCE_IMPORT_LIB_ATTR` keeps its PS4 value.
+    //
+    // All five were later confirmed independently against InoriRus/Kyty
+    // (MIT), which calls them `DT_OS_*_1`. The four tags below came from
+    // that same header — they appear in real files and were previously
+    // reported as `Other`.
     Ps5OriginalFilename,
     Ps5ModuleInfo,
     Ps5NeededModule,
     Ps5ExportLib,
     Ps5ImportLib,
+    SceExportLibAttr,
+    Soname,
+    Rel,
+    RelaCount,
     Other(i64),
 }
 
@@ -145,6 +154,10 @@ impl From<i64> for DynTag {
             0x6100_0045 => Self::Ps5NeededModule,
             0x6100_0047 => Self::Ps5ExportLib,
             0x6100_0049 => Self::Ps5ImportLib,
+            0x6100_0017 => Self::SceExportLibAttr,
+            0xe => Self::Soname,
+            0x11 => Self::Rel,
+            0x6fff_fff9 => Self::RelaCount,
             other => Self::Other(other),
         }
     }
