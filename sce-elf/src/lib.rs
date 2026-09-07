@@ -64,7 +64,18 @@ impl Image {
         cursor.seek(SeekFrom::Start(elf_offset))?;
         let elf_header = ElfHeader::read(&mut cursor)?;
 
-        cursor.seek(SeekFrom::Start(elf_offset + elf_header.e_phoff))?;
+        // A malformed e_phoff must not overflow into a wrapped seek — in a
+        // debug build the addition itself panics.
+        let phoff = elf_offset
+            .checked_add(elf_header.e_phoff)
+            .ok_or(Error::OutOfBounds {
+                what: "program header table",
+                region: "the file",
+                offset: elf_header.e_phoff,
+                size: 0,
+                limit: data.len() as u64,
+            })?;
+        cursor.seek(SeekFrom::Start(phoff))?;
         let program_headers = (0..elf_header.e_phnum)
             .map(|_| ProgramHeader::read(&mut cursor))
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -158,7 +169,17 @@ impl Image {
                 limit: seg.file_size,
             });
         }
-        self.file_slice(seg.file_offset + delta, ph.p_filesz, "SELF segment")
+        let at = seg
+            .file_offset
+            .checked_add(delta)
+            .ok_or(Error::OutOfBounds {
+                what: "SELF segment contents",
+                region: "the file",
+                offset: seg.file_offset,
+                size: delta,
+                limit: self.data.len() as u64,
+            })?;
+        self.file_slice(at, ph.p_filesz, "SELF segment")
     }
 
     /// The contents of the first segment of the given type.

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "Parser for Sony's SELF/ELF binary format (PS4/PS5) with NID hashing"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/pedrocluis/sce-elf"
+keywords = ["ps4", "ps5", "elf", "emulator", "playstation"]
+categories = ["parser-implementations", "encoding"]
 
 [build-dependencies]
 sha1 = "0.10"
