@@ -9,6 +9,10 @@ Built on [`sce-elf`](../sce-elf).
 cargo install nidscan
 ```
 
+Or download a prebuilt binary from
+[Releases](https://github.com/pedrocluis/sce-elf/releases) — Linux, macOS and
+Windows, x86-64 and arm64, no Rust needed.
+
 ## Usage
 
 ```
@@ -23,9 +27,18 @@ nidscan [OPTIONS] [FILE]
   --implemented <FILE>  NIDs an emulator implements (JSON or text)
   --modules <PATH>      Modules the game ships itself. Defaults to a
                         sce_module/ directory beside the target
+  --no-default-data     Ignore the data directory
   --relocations         Lay the image out and apply relocations
   --load-base <ADDR>    Address for --relocations [default: 0x400000]
 ```
+
+## Data directory
+
+With `~/.local/share/nidscan/names/*.txt` and
+`~/.local/share/nidscan/implemented/*.txt` populated, no flags are needed —
+see the [workspace README](../README.md) for how to fill it. Every wordlist is
+merged; only one implemented-list is used, chosen by `default.txt` when there
+is more than one.
 
 ## The compatibility report
 

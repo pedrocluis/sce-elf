@@ -27,13 +27,19 @@ struct Args {
     exports: bool,
 
     /// Extra symbol-name wordlist to resolve NIDs with. Repeatable.
+    /// Overrides the wordlists found in the data directory.
     #[arg(long, value_name = "FILE")]
     names: Vec<PathBuf>,
 
     /// A list of NIDs an emulator implements (JSON or plain text). Prints a
-    /// compatibility report against this binary's imports.
+    /// compatibility report against this binary's imports. Overrides the list
+    /// found in the data directory.
     #[arg(long, value_name = "FILE")]
     implemented: Option<PathBuf>,
+
+    /// Ignore the data directory; use only what is passed explicitly.
+    #[arg(long)]
+    no_default_data: bool,
 
     /// Modules the game ships itself, whose exports the emulator doesn't
     /// need to implement. A directory is scanned for `.prx`/`.sprx`.
@@ -48,6 +54,69 @@ struct Args {
     /// Address to lay the image out at with --relocations.
     #[arg(long, value_name = "ADDR", default_value = "0x400000", value_parser = parse_addr)]
     load_base: u64,
+}
+
+/// Where wordlists and emulator NID lists live when not passed explicitly.
+///
+/// `NIDSCAN_DATA`, else `$XDG_DATA_HOME/nidscan`, else
+/// `~/.local/share/nidscan`, else `%APPDATA%\\nidscan` on Windows. Returns
+/// `None` if the directory doesn't exist, so this is opt-in by creating it.
+fn data_dir() -> Option<PathBuf> {
+    let candidate = std::env::var_os("NIDSCAN_DATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .map(|d| d.join("nidscan"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".local/share/nidscan"))
+        })
+        .or_else(|| {
+            std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .map(|a| a.join("nidscan"))
+        })?;
+    candidate.is_dir().then_some(candidate)
+}
+
+/// The `.txt` files in a directory, sorted. Missing directory means none.
+fn list_dir(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == "txt")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Picks which emulator's NID list to compare against.
+///
+/// One list is unambiguous. With several, only an explicit `default.txt`
+/// decides: a PS4 list and a PS5 list are equally plausible otherwise, and
+/// merging them would be meaningless.
+fn choose_implemented(found: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(default) = found
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "default.txt"))
+    {
+        return Some(default.clone());
+    }
+    match found {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
 }
 
 fn parse_addr(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -65,12 +134,40 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Explicit flags win; otherwise fall back to the data directory, so a
+    // bare `nidscan eboot.bin` gives the full report once it is populated.
+    let auto = (!args.no_default_data).then(data_dir).flatten();
+    let wordlists = if args.names.is_empty() {
+        auto.as_deref()
+            .map(|d| list_dir(&d.join("names")))
+            .unwrap_or_default()
+    } else {
+        args.names.clone()
+    };
+    let implemented = match (&args.implemented, &auto) {
+        (Some(path), _) => Some(path.clone()),
+        (None, Some(dir)) => {
+            let dir = dir.join("implemented");
+            let found = list_dir(&dir);
+            let chosen = choose_implemented(&found);
+            if chosen.is_none() && found.len() > 1 {
+                println!(
+                    "{} NID lists in {}; name one default.txt or pass --implemented",
+                    found.len(),
+                    dir.display()
+                );
+            }
+            chosen
+        }
+        (None, None) => None,
+    };
+
     let mut names = NameTable::new();
-    for path in &args.names {
+    for path in &wordlists {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let added = names.add_wordlist(&text);
-        println!("loaded {added} names from {}", path.display());
+        println!("using {} ({added} names)", path.display());
     }
 
     let path = args
@@ -119,7 +216,7 @@ fn main() -> Result<()> {
 
     print_dynamic(&dynamic, &names, args.imports, args.exports);
 
-    if let Some(list) = &args.implemented {
+    if let Some(list) = &implemented {
         println!();
         let bundled = collect_bundled(&args.modules, &path);
         print_compat_report(&dynamic, &names, list, &bundled)?;
@@ -378,4 +475,45 @@ fn print_relocations(image: &Image, dynamic: &Dynamic, base: u64) -> Result<()> 
         println!("  skipped R_X86_64 type {kind}: {count}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|n| PathBuf::from("/d").join(n)).collect()
+    }
+
+    #[test]
+    fn a_single_list_is_used_without_ceremony() {
+        let found = paths(&["sharpemu.txt"]);
+        assert_eq!(choose_implemented(&found), Some(found[0].clone()));
+    }
+
+    #[test]
+    fn several_lists_need_an_explicit_default() {
+        // A PS4 list and a PS5 list are equally plausible; guessing would
+        // silently report the wrong console's coverage.
+        assert_eq!(
+            choose_implemented(&paths(&["shadps4.txt", "sharpemu.txt"])),
+            None
+        );
+
+        let found = paths(&["default.txt", "shadps4.txt", "sharpemu.txt"]);
+        assert_eq!(choose_implemented(&found), Some(found[0].clone()));
+    }
+
+    #[test]
+    fn no_lists_means_no_report() {
+        assert_eq!(choose_implemented(&[]), None);
+    }
+
+    #[test]
+    fn hex_and_decimal_load_bases_both_parse() {
+        assert_eq!(parse_addr("0x400000").unwrap(), 0x40_0000);
+        assert_eq!(parse_addr("0X400000").unwrap(), 0x40_0000);
+        assert_eq!(parse_addr("4194304").unwrap(), 0x40_0000);
+        assert!(parse_addr("nonsense").is_err());
+    }
 }
