@@ -513,6 +513,38 @@ fn compat_report_counts_unimplemented_imports() {
     assert_eq!(report.coverage(), 1.0);
 }
 
+#[test]
+fn imports_a_bundled_module_supplies_are_not_gaps() {
+    use sce_elf::NidSet;
+    let image = Image::parse(raw_elf()).unwrap();
+    let nothing = NidSet::new();
+
+    // The emulator implements none of it, but the game ships a module that
+    // exports the one import: that is not a gap the emulator has to close.
+    let bundled: NidSet = [IMPORT_NID].into_iter().collect();
+    let report = image.compat_report_with(&nothing, &bundled).unwrap();
+    assert_eq!(report.total(), 1);
+    assert_eq!(report.missing_count(), 0);
+    assert_eq!(report.bundled_count(), 1);
+    assert_eq!(report.implemented(), 0);
+    assert_eq!(report.bundled, vec![expected_import()]);
+    assert_eq!(report.coverage(), 1.0);
+
+    // With nothing bundled it is a gap again, and coverage collapses.
+    let report = image.compat_report_with(&nothing, &nothing).unwrap();
+    assert_eq!(report.missing_count(), 1);
+    assert_eq!(report.bundled_count(), 0);
+    assert_eq!(report.coverage(), 0.0);
+
+    // An import the emulator implements is never double-counted as bundled,
+    // even when a bundled module also exports it.
+    let implemented: NidSet = [IMPORT_NID].into_iter().collect();
+    let report = image.compat_report_with(&implemented, &bundled).unwrap();
+    assert_eq!(report.implemented(), 1);
+    assert_eq!(report.bundled_count(), 0);
+    assert_eq!(report.missing_count(), 0);
+}
+
 /// A PS5-shaped image: no `PT_SCE_DYNLIBDATA` at all, standard `DT_*` tags
 /// holding virtual addresses, and the tables sitting inside a `PT_LOAD`.
 fn ps5_elf() -> Vec<u8> {

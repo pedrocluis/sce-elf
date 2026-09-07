@@ -13,13 +13,20 @@ use crate::dynamic::DynSymbol;
 use crate::error::Result;
 use crate::{Dynamic, Image};
 
-/// The NIDs an emulator implements.
+/// A set of NIDs.
+///
+/// Used for two different things: what an emulator implements, and what a
+/// game's own bundled modules export. Both answer "is this import already
+/// satisfied?", just from different directions.
 #[derive(Debug, Clone, Default)]
-pub struct ImplementedNids {
+pub struct NidSet {
     nids: HashSet<String>,
 }
 
-impl ImplementedNids {
+/// The NIDs an emulator implements.
+pub type ImplementedNids = NidSet;
+
+impl NidSet {
     pub fn new() -> Self {
         Self::default()
     }
@@ -56,7 +63,7 @@ impl ImplementedNids {
     }
 }
 
-impl<S: Into<String>> FromIterator<S> for ImplementedNids {
+impl<S: Into<String>> FromIterator<S> for NidSet {
     fn from_iter<I: IntoIterator<Item = S>>(iter: I) -> Self {
         Self {
             nids: iter.into_iter().map(Into::into).collect(),
@@ -69,8 +76,12 @@ impl<S: Into<String>> FromIterator<S> for ImplementedNids {
 pub struct CompatReport {
     /// Every distinct `(module, library, nid)` the binary imports, sorted.
     pub imports: Vec<DynSymbol>,
-    /// The subset with no implementation, sorted.
+    /// Imports nothing satisfies: not implemented by the emulator, and not
+    /// exported by any bundled module. The real gap.
     pub missing: Vec<DynSymbol>,
+    /// Imports the emulator doesn't implement but a module shipped with the
+    /// game does export, so the emulator never has to provide them.
+    pub bundled: Vec<DynSymbol>,
 }
 
 impl CompatReport {
@@ -78,21 +89,33 @@ impl CompatReport {
         self.imports.len()
     }
 
-    pub fn implemented(&self) -> usize {
+    /// Imports something satisfies, whether the emulator or a bundled module.
+    pub fn satisfied(&self) -> usize {
         self.imports.len() - self.missing.len()
+    }
+
+    /// Imports the emulator itself implements.
+    pub fn implemented(&self) -> usize {
+        self.imports.len() - self.missing.len() - self.bundled.len()
+    }
+
+    /// Imports a bundled module supplies instead of the emulator.
+    pub fn bundled_count(&self) -> usize {
+        self.bundled.len()
     }
 
     pub fn missing_count(&self) -> usize {
         self.missing.len()
     }
 
-    /// Implemented share of the imports, 0.0 to 1.0. An import-free binary
-    /// counts as fully covered.
+    /// Satisfied share of the imports, 0.0 to 1.0 — counting bundled modules,
+    /// since an import a game supplies itself is not a gap. An import-free
+    /// binary counts as fully covered.
     pub fn coverage(&self) -> f64 {
         if self.imports.is_empty() {
             return 1.0;
         }
-        self.implemented() as f64 / self.imports.len() as f64
+        self.satisfied() as f64 / self.imports.len() as f64
     }
 }
 
@@ -101,26 +124,50 @@ impl Dynamic {
     ///
     /// Imports are deduplicated by `(module, library, nid)` and sorted, so
     /// the report is stable across runs.
-    pub fn compat_report(&self, implemented: &ImplementedNids) -> CompatReport {
+    pub fn compat_report(&self, implemented: &NidSet) -> CompatReport {
+        self.compat_report_with(implemented, &NidSet::new())
+    }
+
+    /// Compares this module's imports against `implemented`, treating
+    /// anything in `bundled` as already supplied.
+    ///
+    /// PS5 titles routinely ship their own copies of libraries like `libc` in
+    /// a `sce_module/` directory; the emulator loads those as guest code
+    /// rather than implementing them. Counting them as gaps badly understates
+    /// compatibility — on one retail title it turned 85% coverage into 30%.
+    pub fn compat_report_with(&self, implemented: &NidSet, bundled: &NidSet) -> CompatReport {
         let mut imports = self.imports();
         imports
             .sort_by(|a, b| (&a.module, &a.library, &a.nid).cmp(&(&b.module, &b.library, &b.nid)));
         imports.dedup_by(|a, b| (&a.module, &a.library, &a.nid) == (&b.module, &b.library, &b.nid));
 
-        let missing = imports
-            .iter()
-            .filter(|sym| !implemented.contains(&sym.nid))
+        let unimplemented = imports.iter().filter(|sym| !implemented.contains(&sym.nid));
+        let (bundled, missing): (Vec<_>, Vec<_>) = unimplemented
             .cloned()
-            .collect();
+            .partition(|sym| bundled.contains(&sym.nid));
 
-        CompatReport { imports, missing }
+        CompatReport {
+            imports,
+            missing,
+            bundled,
+        }
     }
 }
 
 impl Image {
     /// Compares this image's imports against `implemented`.
-    pub fn compat_report(&self, implemented: &ImplementedNids) -> Result<CompatReport> {
+    pub fn compat_report(&self, implemented: &NidSet) -> Result<CompatReport> {
         Ok(self.dynamic()?.compat_report(implemented))
+    }
+
+    /// Compares this image's imports against `implemented`, discounting
+    /// anything `bundled` already supplies.
+    pub fn compat_report_with(
+        &self,
+        implemented: &NidSet,
+        bundled: &NidSet,
+    ) -> Result<CompatReport> {
+        Ok(self.dynamic()?.compat_report_with(implemented, bundled))
     }
 }
 
@@ -151,6 +198,7 @@ mod tests {
         let report = CompatReport {
             imports: Vec::new(),
             missing: Vec::new(),
+            bundled: Vec::new(),
         };
         assert_eq!(report.coverage(), 1.0);
         assert_eq!(report.total(), 0);
