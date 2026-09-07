@@ -5,11 +5,24 @@
 
 use binrw::BinRead;
 
+/// The SELF container magic shadPS4 knows, and what PS4 files and PS5
+/// `eboot.bin` carry.
 pub const SELF_MAGIC: u32 = 0x1D3D_154F;
 
+/// A second container magic carried by some PS5 `.sprx` files. The header
+/// layout and everything after it are identical — verified against retail
+/// PS5 libraries, whose ELF header sits at the usual place right after the
+/// segment table.
+pub const SELF_MAGIC_PS5: u32 = 0xEEF5_1454;
+
 #[derive(BinRead, Debug, Clone, Copy)]
-#[br(little, magic = 0x1D3D154Fu32)]
+#[br(little)]
+#[br(assert(
+    magic == SELF_MAGIC || magic == SELF_MAGIC_PS5,
+    "not a SELF container: magic {magic:#010x}"
+))]
 pub struct SelfHeader {
+    pub magic: u32,
     pub version: u8,
     pub mode: u8,
     /// 1 = little endian.
