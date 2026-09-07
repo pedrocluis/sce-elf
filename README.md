@@ -62,21 +62,75 @@ nidscan --name sceKernelGetProcessTime    # hash a name to its NID
 nidscan eboot.bin --relocations       # load the image and apply relocations
 ```
 
-For a compatibility report you need a list of NIDs an emulator implements.
-`scripts/emulator-implemented-nids.sh` scrapes one from a checkout of shadPS4,
-Kyty or SharpEmu:
+`scripts/emulator-implemented-nids.sh` scrapes an implemented-NID list from a
+checkout of shadPS4, Kyty or SharpEmu. Use a PS5-capable emulator's list for a
+PS5 title — shadPS4 is PS4-only and scores near zero against a PS5 binary for
+reasons that say nothing about the game.
 
-```sh
-git clone --depth 1 https://github.com/sharpemu/sharpemu
-scripts/emulator-implemented-nids.sh sharpemu > implemented.txt
-nidscan eboot.bin --implemented implemented.txt
+The bundled wordlists are deliberately modest; see the data directory below.
+
+## Prebuilt binaries
+
+Each release ships `nidscan` for Linux, macOS and Windows (x86-64 and arm64) —
+see [Releases](https://github.com/pedrocluis/sce-elf/releases). No Rust needed.
+
+## Set-up: the data directory
+
+`nidscan` reads wordlists and emulator NID lists from a data directory, so the
+common case needs no flags:
+
+```
+~/.local/share/nidscan/
+├── names/
+│   └── ps5_names.txt          # symbol names, for resolving NIDs
+└── implemented/
+    ├── sharpemu.txt
+    ├── shadps4.txt
+    └── default.txt -> sharpemu.txt
 ```
 
-Use a PS5-capable emulator's list for a PS5 title. shadPS4 is PS4-only and will
-score near zero against a PS5 binary for reasons that say nothing about the game.
+(`$NIDSCAN_DATA` or `$XDG_DATA_HOME/nidscan` override the location;
+`%APPDATA%\nidscan` on Windows. If the directory doesn't exist nothing is
+loaded, so this is entirely opt-in.)
 
-Name coverage from the bundled wordlists is deliberately modest. For real work
-pass a large corpus with `--names`; see [`sce-elf/names/README.md`](sce-elf/names/README.md).
+Every wordlist in `names/` is loaded and merged — more names is strictly
+better. Only *one* list in `implemented/` is used, because merging two
+emulators' coverage would be meaningless: with several, `default.txt` decides,
+otherwise `nidscan` says so and skips the report rather than guessing. Point
+`default.txt` at a PS5 emulator for PS5 titles.
+
+Populate it once:
+
+```sh
+mkdir -p ~/.local/share/nidscan/{names,implemented}
+
+# Symbol names. SharpEmu ships ~154k of them; not bundled here because that
+# repo is GPL-2.0 and the list comes from an unlicensed upstream.
+curl -L -o ~/.local/share/nidscan/names/ps5_names.txt \
+  https://raw.githubusercontent.com/sharpemu/sharpemu/main/scripts/ps5_names.txt
+
+# What an emulator implements.
+git clone --depth 1 https://github.com/sharpemu/sharpemu
+scripts/emulator-implemented-nids.sh sharpemu \
+  > ~/.local/share/nidscan/implemented/sharpemu.txt
+ln -s sharpemu.txt ~/.local/share/nidscan/implemented/default.txt
+```
+
+Then a bare invocation gives the full picture:
+
+```
+$ nidscan eboot.bin
+using ~/.local/share/nidscan/names/ps5_names.txt (154458 names)
+bundled modules: 2 from Game-Files/sce_module, 45743 exported NIDs
+1747 imports (1738 named), 0 exports
+  1747 imports
+    529 implemented by the emulator
+    959 supplied by the game's own modules
+    259 missing (85.2% covered)
+```
+
+Explicit `--names` / `--implemented` override the directory; `--no-default-data`
+ignores it entirely.
 
 ## What works
 
