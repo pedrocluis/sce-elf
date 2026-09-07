@@ -1,8 +1,9 @@
 //! Parser for Sony's SELF/ELF binary format (PS4/PS5).
 //!
 //! Handles the optional SELF signing wrapper, the ELF64 header and program
-//! headers (including `PT_SCE_*` segment types), and NID hashing. See
-//! [`nid::hash`] for symbol-name-to-NID hashing.
+//! headers (including `PT_SCE_*` segment types), the dynamic segment, and NID
+//! hashing. See [`Image::imports`] for the imported `(module, library, nid)`
+//! triples and [`nid::hash`] for symbol-name-to-NID hashing.
 
 pub mod dynamic;
 pub mod elf;
@@ -10,7 +11,9 @@ pub mod error;
 pub mod nid;
 pub mod self_file;
 
-pub use dynamic::{DynEntry, DynTag, Relocation, Symbol};
+pub use dynamic::{
+    DynEntry, DynSymbol, DynTag, Dynamic, LibraryInfo, ModuleInfo, Relocation, Symbol,
+};
 pub use elf::{ElfHeader, ElfType, ProgramHeader, ProgramType};
 pub use error::{Error, Result};
 pub use self_file::{SelfHeader, SelfSegmentHeader};
@@ -79,5 +82,105 @@ impl Image {
     /// recorded offsets.
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// The index of the first program header of the given type.
+    pub fn segment_index(&self, ty: ProgramType) -> Option<usize> {
+        self.program_headers
+            .iter()
+            .position(|ph| ProgramType::from(ph.p_type) == ty)
+    }
+
+    /// The `p_filesz` bytes backing a program header.
+    ///
+    /// For a raw ELF that's just `p_offset`. In a SELF the program headers
+    /// describe the *unwrapped* image, so the bytes actually live wherever
+    /// the SELF segment table put them: each "blocked" SELF segment carries
+    /// the index of the program header it provides in its flags, and its
+    /// `file_offset` is where that program header's contents really start.
+    /// (Matches `Elf::LoadSegment` in shadPS4's `src/core/loader/elf.cpp`.)
+    pub fn segment_data(&self, index: usize) -> Result<&[u8]> {
+        let ph = self
+            .program_headers
+            .get(index)
+            .ok_or(Error::NoSuchSegment(index))?;
+
+        if !self.is_self() {
+            return self.file_slice(ph.p_offset, ph.p_filesz, "program header");
+        }
+
+        let (i, seg) = self
+            .self_segments
+            .iter()
+            .enumerate()
+            .find(|(_, seg)| seg.is_blocked() && seg.id() as usize == index)
+            .ok_or(Error::UnmappedSegment(index))?;
+
+        // Both transforms need the segment's own bytes decoded first; see the
+        // decompression item in TODO.md.
+        if seg.is_encrypted() {
+            return Err(Error::OpaqueSegment {
+                index: i,
+                reason: "encrypted",
+            });
+        }
+        if seg.is_compressed() {
+            return Err(Error::OpaqueSegment {
+                index: i,
+                reason: "compressed",
+            });
+        }
+        if ph.p_filesz > seg.file_size {
+            return Err(Error::OutOfBounds {
+                what: "program header contents",
+                region: "its SELF segment",
+                offset: 0,
+                size: ph.p_filesz,
+                limit: seg.file_size,
+            });
+        }
+        self.file_slice(seg.file_offset, ph.p_filesz, "SELF segment")
+    }
+
+    /// The contents of the first segment of the given type.
+    pub fn segment_data_of(&self, ty: ProgramType, name: &'static str) -> Result<&[u8]> {
+        let index = self.segment_index(ty).ok_or(Error::MissingSegment(name))?;
+        self.segment_data(index)
+    }
+
+    /// Parses `PT_DYNAMIC` against `PT_SCE_DYNLIBDATA`.
+    ///
+    /// Errors with [`Error::MissingSegment`] on an image that has no dynamic
+    /// segment (a static `ET_SCE_EXEC`, say), and with
+    /// [`Error::OpaqueSegment`] when the segments are still compressed or
+    /// encrypted inside a signed SELF.
+    pub fn dynamic(&self) -> Result<Dynamic> {
+        let dynamic = self.segment_data_of(ProgramType::Dynamic, "PT_DYNAMIC")?;
+        let dynlibdata = self.segment_data_of(ProgramType::SceDynlibData, "PT_SCE_DYNLIBDATA")?;
+        Dynamic::parse(dynamic, dynlibdata)
+    }
+
+    /// The `(module, library, nid)` triples this image imports.
+    pub fn imports(&self) -> Result<Vec<DynSymbol>> {
+        Ok(self.dynamic()?.imports())
+    }
+
+    /// The `(module, library, nid)` triples this image exports.
+    pub fn exports(&self) -> Result<Vec<DynSymbol>> {
+        Ok(self.dynamic()?.exports())
+    }
+
+    fn file_slice(&self, offset: u64, size: u64, what: &'static str) -> Result<&[u8]> {
+        let limit = self.data.len() as u64;
+        match offset.checked_add(size) {
+            Some(end) if end <= limit => Ok(&self.data[offset as usize..end as usize]),
+            _ => Err(Error::OutOfBounds {
+                what,
+                region: "the file",
+                offset,
+                size,
+                limit,
+            }),
+        }
     }
 }

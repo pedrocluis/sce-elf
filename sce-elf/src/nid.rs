@@ -7,16 +7,19 @@
 //! `sceKernelGetProcessTime` -> `4J2sUJmuHZQ`
 //! (https://github.com/shadps4-emu/shadPS4).
 
+use base64::Engine;
 use base64::alphabet::Alphabet;
 use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
-use base64::Engine;
 use sha1::{Digest, Sha1};
 
 const NID_SALT: [u8; 16] = [
     0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30,
 ];
 
-const NID_ALPHABET: &str =
+/// Sony's base64 alphabet: standard, but with `+/` replaced by `+-`. Shared
+/// with [`crate::dynamic::encode_id`], which encodes module/library ids under
+/// the same alphabet.
+pub(crate) const NID_ALPHABET: &str =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
 
 fn engine() -> GeneralPurpose {

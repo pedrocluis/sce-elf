@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sce_elf::{nid, Image, ProgramType};
+use sce_elf::dynamic::STT_FUNC;
+use sce_elf::{DynSymbol, Dynamic, Image, ProgramType, nid};
 
 /// Inspect PS4/PS5 SELF/ELF binaries.
 #[derive(Parser)]
@@ -14,6 +15,14 @@ struct Args {
     /// Hash a symbol name into its NID instead of scanning a file.
     #[arg(long)]
     name: Option<String>,
+
+    /// List every imported symbol, not just the count.
+    #[arg(long)]
+    imports: bool,
+
+    /// List every exported symbol, not just the count.
+    #[arg(long)]
+    exports: bool,
 }
 
 fn main() -> Result<()> {
@@ -51,6 +60,80 @@ fn main() -> Result<()> {
             ph.p_memsz
         );
     }
+    println!();
+
+    match image.dynamic() {
+        Ok(dynamic) => print_dynamic(&dynamic, args.imports, args.exports),
+        // Not every image has a dynamic segment, and a signed SELF's segments
+        // can't be read yet — neither is a reason to fail the whole scan.
+        Err(err) => println!("dynamic segment: unavailable ({err})"),
+    }
 
     Ok(())
+}
+
+fn print_dynamic(dynamic: &Dynamic, list_imports: bool, list_exports: bool) {
+    println!("dynamic segment:");
+    for module in &dynamic.export_modules {
+        println!(
+            "  module:   {} (id {}, v{}.{}, {})",
+            module.name, module.id, module.version_major, module.version_minor, module.enc_id
+        );
+    }
+    if let Some(filename) = &dynamic.original_filename {
+        println!("  filename: {filename}");
+    }
+    println!(
+        "  {} dyn entries, {} symbols, {}-byte string table",
+        dynamic.entries.len(),
+        dynamic.symbols.len(),
+        dynamic.str_table.len()
+    );
+
+    for module in &dynamic.import_modules {
+        println!(
+            "  needs module:  {:<28} id {:<5} v{}.{} ({})",
+            module.name, module.id, module.version_major, module.version_minor, module.enc_id
+        );
+    }
+    for name in &dynamic.needed {
+        println!("  needs:         {name}");
+    }
+    for lib in &dynamic.export_libs {
+        println!(
+            "  exports lib:   {:<28} id {:<5} v{} ({})",
+            lib.name, lib.id, lib.version, lib.enc_id
+        );
+    }
+    for lib in &dynamic.import_libs {
+        println!(
+            "  imports lib:   {:<28} id {:<5} v{} ({})",
+            lib.name, lib.id, lib.version, lib.enc_id
+        );
+    }
+
+    let imports = dynamic.imports();
+    let exports = dynamic.exports();
+    println!();
+    println!("{} imports, {} exports", imports.len(), exports.len());
+    if list_imports {
+        print_symbols("imports", &imports);
+    }
+    if list_exports {
+        print_symbols("exports", &exports);
+    }
+}
+
+fn print_symbols(heading: &str, symbols: &[DynSymbol]) {
+    println!();
+    println!("{heading}:");
+    for sym in symbols {
+        println!(
+            "  {} {:<11}  {}::{}",
+            if sym.kind == STT_FUNC { "fn " } else { "obj" },
+            sym.nid,
+            sym.module,
+            sym.library
+        );
+    }
 }
