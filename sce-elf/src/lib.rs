@@ -5,17 +5,22 @@
 //! hashing. See [`Image::imports`] for the imported `(module, library, nid)`
 //! triples and [`nid::hash`] for symbol-name-to-NID hashing.
 
+pub mod compat;
 pub mod dynamic;
 pub mod elf;
 pub mod error;
+pub mod load;
 pub mod nid;
 pub mod self_file;
 
+pub use compat::{CompatReport, ImplementedNids};
 pub use dynamic::{
-    DynEntry, DynSymbol, DynTag, Dynamic, LibraryInfo, ModuleInfo, Relocation, Symbol,
+    DynEntry, DynSymbol, DynTag, Dynamic, DynlibData, LibraryInfo, ModuleInfo, Relocation, Symbol,
+    TableSource,
 };
 pub use elf::{ElfHeader, ElfType, ProgramHeader, ProgramType};
 pub use error::{Error, Result};
+pub use load::{LoadedImage, RelocationReport, UnresolvedSymbol};
 pub use self_file::{SelfHeader, SelfSegmentHeader};
 
 use binrw::BinRead;
@@ -43,7 +48,11 @@ impl Image {
                 let segments = (0..header.segment_count)
                     .map(|_| SelfSegmentHeader::read(&mut cursor))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                let offset = header.header_size as u64;
+                // The ELF header follows the segment table immediately. It is
+                // *not* at `header_size`, which measures the whole header
+                // block right through to where the segment payloads start —
+                // `elf_header_pos = Tell()` in shadPS4's `Elf::Open`.
+                let offset = cursor.stream_position()?;
                 (Some(header), segments, offset)
             }
             Err(_) => {
@@ -109,11 +118,21 @@ impl Image {
             return self.file_slice(ph.p_offset, ph.p_filesz, "program header");
         }
 
-        let (i, seg) = self
+        // A blocked SELF segment carries the payload of the program header
+        // its id names — but a header whose contents merely *live inside*
+        // that one (PT_DYNAMIC sitting within a PT_LOAD, say) has no segment
+        // of its own. So match on containment, not on the id, and read at the
+        // same relative position within the payload.
+        let (i, seg, delta) = self
             .self_segments
             .iter()
             .enumerate()
-            .find(|(_, seg)| seg.is_blocked() && seg.id() as usize == index)
+            .filter(|(_, seg)| seg.is_blocked())
+            .find_map(|(i, seg)| {
+                let owner = self.program_headers.get(seg.id() as usize)?;
+                let delta = ph.p_offset.checked_sub(owner.p_offset)?;
+                (delta < owner.p_filesz).then_some((i, seg, delta))
+            })
             .ok_or(Error::UnmappedSegment(index))?;
 
         // Both transforms need the segment's own bytes decoded first; see the
@@ -130,16 +149,16 @@ impl Image {
                 reason: "compressed",
             });
         }
-        if ph.p_filesz > seg.file_size {
+        if delta.saturating_add(ph.p_filesz) > seg.file_size {
             return Err(Error::OutOfBounds {
                 what: "program header contents",
                 region: "its SELF segment",
-                offset: 0,
+                offset: delta,
                 size: ph.p_filesz,
                 limit: seg.file_size,
             });
         }
-        self.file_slice(seg.file_offset, ph.p_filesz, "SELF segment")
+        self.file_slice(seg.file_offset + delta, ph.p_filesz, "SELF segment")
     }
 
     /// The contents of the first segment of the given type.
@@ -148,7 +167,13 @@ impl Image {
         self.segment_data(index)
     }
 
-    /// Parses `PT_DYNAMIC` against `PT_SCE_DYNLIBDATA`.
+    /// Parses `PT_DYNAMIC`, reading the tables it points at from wherever
+    /// this image keeps them.
+    ///
+    /// PS4 images have a `PT_SCE_DYNLIBDATA` segment and their `DT_SCE_*`
+    /// tags hold offsets into it. PS5 images have no such segment: they use
+    /// the standard `DT_*` tags holding virtual addresses, resolved here
+    /// through the loadable segments. Both are handled.
     ///
     /// Errors with [`Error::MissingSegment`] on an image that has no dynamic
     /// segment (a static `ET_SCE_EXEC`, say), and with
@@ -156,8 +181,43 @@ impl Image {
     /// encrypted inside a signed SELF.
     pub fn dynamic(&self) -> Result<Dynamic> {
         let dynamic = self.segment_data_of(ProgramType::Dynamic, "PT_DYNAMIC")?;
-        let dynlibdata = self.segment_data_of(ProgramType::SceDynlibData, "PT_SCE_DYNLIBDATA")?;
-        Dynamic::parse(dynamic, dynlibdata)
+        match self.segment_index(ProgramType::SceDynlibData) {
+            Some(index) => {
+                Dynamic::parse_from(dynamic, &dynamic::DynlibData(self.segment_data(index)?))
+            }
+            None => Dynamic::parse_from(dynamic, self),
+        }
+    }
+
+    /// Resolves a virtual address to the file bytes backing it, through the
+    /// loadable segments. Used for the PS5 dynamic layout, whose tags hold
+    /// addresses rather than `PT_SCE_DYNLIBDATA` offsets.
+    pub fn data_at_vaddr(&self, vaddr: u64, size: u64) -> Result<&[u8]> {
+        for (index, ph) in self.program_headers.iter().enumerate() {
+            let ty = ProgramType::from(ph.p_type);
+            if ty != ProgramType::Load && ty != ProgramType::SceRelro {
+                continue;
+            }
+            let Some(delta) = vaddr.checked_sub(ph.p_vaddr) else {
+                continue;
+            };
+            if delta >= ph.p_filesz {
+                continue;
+            }
+            let bytes = self.segment_data(index)?;
+            let end = delta.checked_add(size);
+            return match end {
+                Some(end) if end <= bytes.len() as u64 => Ok(&bytes[delta as usize..end as usize]),
+                _ => Err(Error::OutOfBounds {
+                    what: "table",
+                    region: "its loadable segment",
+                    offset: delta,
+                    size,
+                    limit: bytes.len() as u64,
+                }),
+            };
+        }
+        Err(Error::UnmappedAddress(vaddr))
     }
 
     /// The `(module, library, nid)` triples this image imports.
@@ -182,5 +242,26 @@ impl Image {
                 limit,
             }),
         }
+    }
+}
+
+/// PS5 images address their dynamic tables by virtual address.
+impl dynamic::TableSource for Image {
+    fn slice(&self, what: &'static str, at: u64, size: u64) -> Result<&[u8]> {
+        self.data_at_vaddr(at, size).map_err(|err| match err {
+            Error::OutOfBounds {
+                region,
+                offset,
+                limit,
+                ..
+            } => Error::OutOfBounds {
+                what,
+                region,
+                offset,
+                size,
+                limit,
+            },
+            other => other,
+        })
     }
 }

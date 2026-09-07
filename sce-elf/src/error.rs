@@ -35,6 +35,9 @@ pub enum Error {
         size: u64,
         minimum: u64,
     },
+    /// A PS5 dynamic tag pointed at an address no loadable segment covers.
+    #[error("no loadable segment contains virtual address {0:#x}")]
+    UnmappedAddress(u64),
     #[error("string table offset {0:#x} is not a NUL-terminated UTF-8 string")]
     BadString(u64),
 }
