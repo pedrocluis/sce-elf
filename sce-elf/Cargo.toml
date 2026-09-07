@@ -1,0 +1,12 @@
+[package]
+name = "sce-elf"
+version = "0.1.0"
+edition = "2024"
+description = "Parser for Sony's SELF/ELF binary format (PS4/PS5) with NID hashing"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+binrw = "0.14"
+thiserror = "2"
+sha1 = "0.10"
+base64 = "0.22"
