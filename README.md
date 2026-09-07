@@ -72,9 +72,11 @@ scripts/emulator-implemented-nids.sh ~/src/shadPS4
 scripts/emulator-implemented-nids.sh --install    # all three, into the data dir
 ```
 
-It knows shadPS4, Kyty and SharpEmu. Use a PS5-capable emulator's list for a
-PS5 title — shadPS4 is PS4-only and scores near zero against a PS5 binary for
-reasons that say nothing about the game.
+It knows shadPS4, Kyty, KytyPS5 and SharpEmu. (Kyty and KytyPS5 are separate
+projects, not forks of each other — same registration macro, different layout
+and scope.) Use a PS5-capable emulator's list for a PS5 title: shadPS4 is
+PS4-only, and against a PS5 binary its gaps say more about the console
+mismatch than about the game.
 
 The bundled wordlists are deliberately modest; see the data directory below.
 
@@ -118,8 +120,8 @@ mkdir -p ~/.local/share/nidscan/names
 curl -L -o ~/.local/share/nidscan/names/ps5_names.txt \
   https://raw.githubusercontent.com/sharpemu/sharpemu/main/scripts/ps5_names.txt
 
-# What each emulator implements. Clones shadPS4, Kyty and SharpEmu into
-# ~/.cache/nidscan, scrapes each, and points default.txt at the PS5 one.
+# What each emulator implements. Clones shadPS4, Kyty, KytyPS5 and SharpEmu
+# into ~/.cache/nidscan, scrapes each, and points default.txt at KytyPS5.
 scripts/emulator-implemented-nids.sh --install
 ```
 
