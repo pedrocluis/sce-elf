@@ -47,7 +47,11 @@ impl Image {
                 let segments = (0..header.segment_count)
                     .map(|_| SelfSegmentHeader::read(&mut cursor))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                let offset = header.header_size as u64;
+                // The ELF header follows the segment table immediately. It is
+                // *not* at `header_size`, which measures the whole header
+                // block right through to where the segment payloads start —
+                // `elf_header_pos = Tell()` in shadPS4's `Elf::Open`.
+                let offset = cursor.stream_position()?;
                 (Some(header), segments, offset)
             }
             Err(_) => {
@@ -113,11 +117,21 @@ impl Image {
             return self.file_slice(ph.p_offset, ph.p_filesz, "program header");
         }
 
-        let (i, seg) = self
+        // A blocked SELF segment carries the payload of the program header
+        // its id names — but a header whose contents merely *live inside*
+        // that one (PT_DYNAMIC sitting within a PT_LOAD, say) has no segment
+        // of its own. So match on containment, not on the id, and read at the
+        // same relative position within the payload.
+        let (i, seg, delta) = self
             .self_segments
             .iter()
             .enumerate()
-            .find(|(_, seg)| seg.is_blocked() && seg.id() as usize == index)
+            .filter(|(_, seg)| seg.is_blocked())
+            .find_map(|(i, seg)| {
+                let owner = self.program_headers.get(seg.id() as usize)?;
+                let delta = ph.p_offset.checked_sub(owner.p_offset)?;
+                (delta < owner.p_filesz).then_some((i, seg, delta))
+            })
             .ok_or(Error::UnmappedSegment(index))?;
 
         // Both transforms need the segment's own bytes decoded first; see the
@@ -134,16 +148,16 @@ impl Image {
                 reason: "compressed",
             });
         }
-        if ph.p_filesz > seg.file_size {
+        if delta.saturating_add(ph.p_filesz) > seg.file_size {
             return Err(Error::OutOfBounds {
                 what: "program header contents",
                 region: "its SELF segment",
-                offset: 0,
+                offset: delta,
                 size: ph.p_filesz,
                 limit: seg.file_size,
             });
         }
-        self.file_slice(seg.file_offset, ph.p_filesz, "SELF segment")
+        self.file_slice(seg.file_offset + delta, ph.p_filesz, "SELF segment")
     }
 
     /// The contents of the first segment of the given type.

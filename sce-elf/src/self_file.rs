@@ -18,7 +18,10 @@ pub struct SelfHeader {
     pub category: u8,
     pub program_type: u8,
     pub padding1: u16,
-    /// Offset of the wrapped ELF header from the start of the file.
+    /// Size of the whole header block — this header, the segment table, the
+    /// wrapped ELF header and its tables, and the signing area — i.e. where
+    /// the segment payloads start. *Not* the offset of the ELF header, which
+    /// sits immediately after the segment table.
     pub header_size: u16,
     pub meta_size: u16,
     pub file_size: u32,

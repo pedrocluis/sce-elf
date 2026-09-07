@@ -221,54 +221,60 @@ fn raw_elf() -> Vec<u8> {
     file
 }
 
-/// The same image wrapped in a SELF, with the program headers pointing at
-/// offsets that only the SELF segment table can resolve.
-fn self_file(encrypt_dynlibdata: bool) -> Vec<u8> {
+/// The same image wrapped in a SELF, shaped like a real one: a single
+/// blocked segment carries a `PT_LOAD` payload, and `PT_DYNAMIC` and
+/// `PT_SCE_DYNLIBDATA` merely live *inside* that load segment rather than
+/// having SELF segments of their own. The program headers advertise virtual
+/// offsets nothing but the SELF segment table can resolve, and `header_size`
+/// is deliberately not the ELF header's offset — both mistakes a reader can
+/// silently make.
+fn self_file(encrypt: bool) -> Vec<u8> {
     let (dynamic, dynlibdata) = segments();
-    const HEADER_SIZE: u64 = 32 + 32 * 2; // SELF header + two segment headers
-    let dynamic_at = 512u64;
-    let dynlibdata_at = 1024u64;
+    const HEADER_SIZE: u64 = 32 + 32; // SELF header + one segment header
+    /// What `header_size` really measures: the whole header block, well past
+    /// the ELF header. Using it as the ELF offset must fail.
+    const HEADER_BLOCK_SIZE: u16 = 0x400;
+
+    // The bytes the one blocked SELF segment actually carries.
+    let mut payload = dynamic.clone();
+    payload.resize(payload.len().next_multiple_of(16), 0);
+    let dynlibdata_in_payload = payload.len() as u64;
+    payload.extend_from_slice(&dynlibdata);
+
+    // The virtual offsets the program headers advertise.
+    let load_voff = 0x10_0000u64;
+    let payload_at = 512u64;
 
     let mut file = Vec::new();
     file.extend_from_slice(&0x1D3D_154Fu32.to_le_bytes());
     file.extend_from_slice(&[0, 1, 1, 0x12, 1, 1]); // version, mode, endian, ...
     file.extend_from_slice(&0u16.to_le_bytes()); // padding1
-    file.extend_from_slice(&(HEADER_SIZE as u16).to_le_bytes());
+    file.extend_from_slice(&HEADER_BLOCK_SIZE.to_le_bytes());
     file.extend_from_slice(&0u16.to_le_bytes()); // meta_size
     file.extend_from_slice(&0u32.to_le_bytes()); // file_size
     file.extend_from_slice(&0u32.to_le_bytes()); // padding2
-    file.extend_from_slice(&2u16.to_le_bytes()); // segment_count
+    file.extend_from_slice(&1u16.to_le_bytes()); // segment_count
     file.extend_from_slice(&0u16.to_le_bytes()); // unknown1a
     file.extend_from_slice(&0u32.to_le_bytes()); // padding3
 
-    // "Blocked", with the program header index in bits 20..32.
-    let mut segment_header = |id: u64, extra_flags: u64, offset: u64, size: u64| {
-        file.extend_from_slice(&(0x800 | (id << 20) | extra_flags).to_le_bytes());
-        file.extend_from_slice(&offset.to_le_bytes());
-        file.extend_from_slice(&size.to_le_bytes());
-        file.extend_from_slice(&size.to_le_bytes());
-    };
-    segment_header(0, 0, dynamic_at, dynamic.len() as u64);
-    segment_header(
-        1,
-        if encrypt_dynlibdata { 2 } else { 0 },
-        dynlibdata_at,
-        dynlibdata.len() as u64,
-    );
+    // Blocked, carrying program header 0 (the PT_LOAD), id in bits 20..32.
+    let flags = 0x800u64 | if encrypt { 2 } else { 0 };
+    file.extend_from_slice(&flags.to_le_bytes());
+    file.extend_from_slice(&payload_at.to_le_bytes());
+    file.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    file.extend_from_slice(&(payload.len() as u64).to_le_bytes());
 
     assert_eq!(file.len() as u64, HEADER_SIZE);
-    file.extend(elf_header(64, 2));
-    // Offsets a naive reader would follow straight off the end of the file.
-    file.extend(program_header(PT_DYNAMIC, 0x10_0000, dynamic.len() as u64));
+    file.extend(elf_header(64, 3));
+    file.extend(program_header(PT_LOAD, load_voff, payload.len() as u64));
+    file.extend(program_header(PT_DYNAMIC, load_voff, dynamic.len() as u64));
     file.extend(program_header(
         PT_SCE_DYNLIBDATA,
-        0x20_0000,
+        load_voff + dynlibdata_in_payload,
         dynlibdata.len() as u64,
     ));
-    file.resize(dynamic_at as usize, 0);
-    file.extend_from_slice(&dynamic);
-    file.resize(dynlibdata_at as usize, 0);
-    file.extend_from_slice(&dynlibdata);
+    file.resize(payload_at as usize, 0);
+    file.extend_from_slice(&payload);
     file
 }
 
@@ -321,13 +327,25 @@ fn resolves_program_header_offsets_through_the_self_segment_table() {
     let image = Image::parse(self_file(false)).unwrap();
     assert!(image.is_self());
 
-    // The program headers point far past the end of the file on their own.
+    // The ELF header follows the segment table, and `header_size` is
+    // something else entirely.
+    assert_eq!(image.elf_offset, 32 + 32);
+    assert_ne!(
+        image.self_header.unwrap().header_size as u64,
+        image.elf_offset,
+        "header_size must not be usable as the ELF offset by accident"
+    );
+
+    // The program headers point far past the end of the file on their own,
+    // and PT_SCE_DYNLIBDATA has no SELF segment of its own — it is nested
+    // inside the PT_LOAD that does.
     let dynlibdata = image
         .program_headers
         .iter()
         .find(|ph| ph.p_type == PT_SCE_DYNLIBDATA)
         .unwrap();
     assert!(dynlibdata.p_offset > image.data().len() as u64);
+    assert_eq!(image.self_segments.len(), 1);
 
     assert_eq!(image.imports().unwrap(), vec![expected_import()]);
     assert_eq!(image.exports().unwrap(), vec![expected_export()]);
@@ -341,7 +359,7 @@ fn reports_segments_it_cannot_decode_yet() {
         matches!(
             err,
             Error::OpaqueSegment {
-                index: 1,
+                index: 0,
                 reason: "encrypted"
             }
         ),
