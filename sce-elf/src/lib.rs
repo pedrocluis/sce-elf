@@ -13,7 +13,7 @@ pub mod load;
 pub mod nid;
 pub mod self_file;
 
-pub use compat::{CompatReport, ImplementedNids};
+pub use compat::{CompatReport, ImplementedNids, NidSet};
 pub use dynamic::{
     DynEntry, DynSymbol, DynTag, Dynamic, DynlibData, LibraryInfo, ModuleInfo, Relocation, Symbol,
     TableSource,

@@ -5,7 +5,7 @@ use clap::Parser;
 use sce_elf::compat::ImplementedNids;
 use sce_elf::dynamic::STT_FUNC;
 use sce_elf::nid::NameTable;
-use sce_elf::{DynSymbol, Dynamic, Image, ProgramType, nid};
+use sce_elf::{DynSymbol, Dynamic, Image, NidSet, ProgramType, nid};
 
 /// Inspect PS4/PS5 SELF/ELF binaries.
 #[derive(Parser)]
@@ -34,6 +34,12 @@ struct Args {
     /// compatibility report against this binary's imports.
     #[arg(long, value_name = "FILE")]
     implemented: Option<PathBuf>,
+
+    /// Modules the game ships itself, whose exports the emulator doesn't
+    /// need to implement. A directory is scanned for `.prx`/`.sprx`.
+    /// Repeatable. Defaults to a `sce_module/` directory beside the target.
+    #[arg(long, value_name = "PATH")]
+    modules: Vec<PathBuf>,
 
     /// Lay the image out and apply relocations, reporting what resolved.
     #[arg(long)]
@@ -115,7 +121,8 @@ fn main() -> Result<()> {
 
     if let Some(list) = &args.implemented {
         println!();
-        print_compat_report(&dynamic, &names, list)?;
+        let bundled = collect_bundled(&args.modules, &path);
+        print_compat_report(&dynamic, &names, list, &bundled)?;
     }
 
     if args.relocations {
@@ -236,25 +243,109 @@ fn read_implemented(path: &Path) -> Result<ImplementedNids> {
     Ok(ImplementedNids::from_text(&text))
 }
 
-fn print_compat_report(dynamic: &Dynamic, names: &NameTable, list: &Path) -> Result<()> {
+/// Exports of the modules the game ships with itself.
+///
+/// A PS5 title routinely bundles its own `libc.prx` and friends under
+/// `sce_module/`; the emulator loads those as guest code rather than
+/// implementing them, so counting their functions as gaps is wrong. With no
+/// `--modules`, a `sce_module/` directory beside the target is used.
+fn collect_bundled(explicit: &[PathBuf], target: &Path) -> NidSet {
+    let mut roots: Vec<PathBuf> = explicit.to_vec();
+    if roots.is_empty() {
+        let beside = target
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sce_module");
+        if beside.is_dir() {
+            roots.push(beside);
+        }
+    }
+
+    let mut files = Vec::new();
+    for root in &roots {
+        if root.is_dir() {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                eprintln!("warning: cannot read {}", root.display());
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext.eq_ignore_ascii_case("prx") || ext.eq_ignore_ascii_case("sprx") {
+                    files.push(path);
+                }
+            }
+        } else {
+            files.push(root.clone());
+        }
+    }
+    files.sort();
+
+    let mut set = NidSet::new();
+    let mut loaded = 0usize;
+    for file in &files {
+        match std::fs::read(file)
+            .map_err(anyhow::Error::from)
+            .and_then(|d| Image::parse(d).map_err(anyhow::Error::from))
+            .and_then(|i| i.exports().map_err(anyhow::Error::from))
+        {
+            Ok(exports) => {
+                for sym in exports {
+                    set.insert(sym.nid);
+                }
+                loaded += 1;
+            }
+            // A module we can't read just doesn't contribute; it must not
+            // sink the whole report.
+            Err(err) => eprintln!("warning: skipping {}: {err}", file.display()),
+        }
+    }
+
+    if loaded > 0 {
+        println!(
+            "bundled modules: {loaded} from {}, {} exported NIDs",
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            set.len()
+        );
+    }
+    set
+}
+
+fn print_compat_report(
+    dynamic: &Dynamic,
+    names: &NameTable,
+    list: &Path,
+    bundled: &NidSet,
+) -> Result<()> {
     let implemented = read_implemented(list)?;
-    let report = dynamic.compat_report(&implemented);
+    let report = dynamic.compat_report_with(&implemented, bundled);
 
     println!(
         "compatibility vs. {} ({} NIDs implemented):",
         list.display(),
         implemented.len()
     );
+    println!("  {} imports", report.total());
+    println!("    {} implemented by the emulator", report.implemented());
+    if report.bundled_count() > 0 {
+        println!(
+            "    {} supplied by the game's own modules",
+            report.bundled_count()
+        );
+    }
     println!(
-        "  {} imports, {} unimplemented ({:.1}% covered)",
-        report.total(),
+        "    {} missing ({:.1}% covered)",
         report.missing_count(),
         report.coverage() * 100.0
     );
 
     if !report.missing.is_empty() {
         println!();
-        println!("unimplemented:");
+        println!("missing:");
         for sym in &report.missing {
             println!("  {}", describe(sym, names));
         }
