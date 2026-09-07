@@ -62,8 +62,17 @@ nidscan --name sceKernelGetProcessTime    # hash a name to its NID
 nidscan eboot.bin --relocations       # load the image and apply relocations
 ```
 
-`scripts/emulator-implemented-nids.sh` scrapes an implemented-NID list from a
-checkout of shadPS4, Kyty or SharpEmu. Use a PS5-capable emulator's list for a
+`scripts/emulator-implemented-nids.sh` produces the implemented-NID list. Give
+it an emulator name and it clones the repo itself; give it a path and it reads
+a checkout you already have:
+
+```sh
+scripts/emulator-implemented-nids.sh sharpemu     # clones into ~/.cache/nidscan
+scripts/emulator-implemented-nids.sh ~/src/shadPS4
+scripts/emulator-implemented-nids.sh --install    # all three, into the data dir
+```
+
+It knows shadPS4, Kyty and SharpEmu. Use a PS5-capable emulator's list for a
 PS5 title — shadPS4 is PS4-only and scores near zero against a PS5 binary for
 reasons that say nothing about the game.
 
@@ -102,19 +111,20 @@ otherwise `nidscan` says so and skips the report rather than guessing. Point
 Populate it once:
 
 ```sh
-mkdir -p ~/.local/share/nidscan/{names,implemented}
+mkdir -p ~/.local/share/nidscan/names
 
 # Symbol names. SharpEmu ships ~154k of them; not bundled here because that
 # repo is GPL-2.0 and the list comes from an unlicensed upstream.
 curl -L -o ~/.local/share/nidscan/names/ps5_names.txt \
   https://raw.githubusercontent.com/sharpemu/sharpemu/main/scripts/ps5_names.txt
 
-# What an emulator implements.
-git clone --depth 1 https://github.com/sharpemu/sharpemu
-scripts/emulator-implemented-nids.sh sharpemu \
-  > ~/.local/share/nidscan/implemented/sharpemu.txt
-ln -s sharpemu.txt ~/.local/share/nidscan/implemented/default.txt
+# What each emulator implements. Clones shadPS4, Kyty and SharpEmu into
+# ~/.cache/nidscan, scrapes each, and points default.txt at the PS5 one.
+scripts/emulator-implemented-nids.sh --install
 ```
+
+Re-run `--install` whenever you want fresh numbers; it updates the existing
+checkouts rather than recloning.
 
 Then a bare invocation gives the full picture:
 
