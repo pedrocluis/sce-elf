@@ -2,9 +2,13 @@
 //! built both as a raw ELF and as a SELF whose program header offsets have to
 //! be remapped through the SELF segment table.
 
-use sce_elf::dynamic::{STB_GLOBAL, STT_FUNC};
-use sce_elf::{DynSymbol, Error, Image, ProgramType};
+use sce_elf::dynamic::{
+    R_X86_64_DTPMOD64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, STB_GLOBAL,
+    STT_FUNC,
+};
+use sce_elf::{DynSymbol, Error, Image, ImplementedNids, ProgramType};
 
+const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_SCE_DYNLIBDATA: u32 = 0x6100_0000;
 
@@ -13,6 +17,11 @@ const DT_SCE_MODULE_INFO: i64 = 0x6100_000d;
 const DT_SCE_NEEDED_MODULE: i64 = 0x6100_000f;
 const DT_SCE_EXPORT_LIB: i64 = 0x6100_0013;
 const DT_SCE_IMPORT_LIB: i64 = 0x6100_0015;
+const DT_SCE_JMPREL: i64 = 0x6100_0029;
+const DT_SCE_PLTRELSZ: i64 = 0x6100_002d;
+const DT_SCE_RELA: i64 = 0x6100_002f;
+const DT_SCE_RELASZ: i64 = 0x6100_0031;
+const DT_SCE_RELAENT: i64 = 0x6100_0033;
 const DT_SCE_STRTAB: i64 = 0x6100_0035;
 const DT_SCE_STRSZ: i64 = 0x6100_0037;
 const DT_SCE_SYMTAB: i64 = 0x6100_0039;
@@ -20,6 +29,10 @@ const DT_SCE_SYMENT: i64 = 0x6100_003b;
 const DT_SCE_SYMTABSZ: i64 = 0x6100_003f;
 
 const IMPORT_NID: &str = "AbCdEfGhIjK";
+/// Addend on the `R_X86_64_RELATIVE` entry in the fixture.
+const RELATIVE_ADDEND: i64 = 0x1234;
+/// `p_vaddr`/size of the fixture's `PT_LOAD`, which the relocations target.
+const LOAD_SIZE: u64 = 0x40;
 const EXPORT_NID: &str = "ZyXwVuTsRqP";
 
 #[derive(Default)]
@@ -50,6 +63,12 @@ fn symbol(out: &mut Vec<u8>, st_name: u32, st_info: u8, st_value: u64) {
     out.extend_from_slice(&0u16.to_le_bytes()); // st_shndx
     out.extend_from_slice(&st_value.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes()); // st_size
+}
+
+fn relocation(out: &mut Vec<u8>, r_offset: u64, kind: u32, symbol: u32, addend: i64) {
+    out.extend_from_slice(&r_offset.to_le_bytes());
+    out.extend_from_slice(&(((symbol as u64) << 32) | kind as u64).to_le_bytes());
+    out.extend_from_slice(&addend.to_le_bytes());
 }
 
 /// `name_offset: u32`, `version_minor: u8`, `version_major: u8`, `id: u16`.
@@ -84,16 +103,35 @@ fn segments() -> (Vec<u8>, Vec<u8>) {
     // A local symbol, which takes no part in linking either way.
     symbol(&mut symtab, import_name, STT_FUNC, 0);
 
+    // Symbol 0 is the import, symbol 1 the export defined in this image.
+    let mut rela = Vec::new();
+    relocation(&mut rela, 0x00, R_X86_64_RELATIVE, 0, RELATIVE_ADDEND);
+    relocation(&mut rela, 0x10, R_X86_64_GLOB_DAT, 1, 0);
+    relocation(&mut rela, 0x18, R_X86_64_DTPMOD64, 0, 0);
+    let mut jmprel = Vec::new();
+    relocation(&mut jmprel, 0x08, R_X86_64_JUMP_SLOT, 0, 0);
+
     let mut dynlibdata = strtab.0;
     dynlibdata.resize(dynlibdata.len().next_multiple_of(8), 0);
     let symtab_offset = dynlibdata.len() as u64;
     let symtab_size = symtab.len() as u64;
     dynlibdata.extend_from_slice(&symtab);
+    let rela_offset = dynlibdata.len() as u64;
+    let rela_size = rela.len() as u64;
+    dynlibdata.extend_from_slice(&rela);
+    let jmprel_offset = dynlibdata.len() as u64;
+    let jmprel_size = jmprel.len() as u64;
+    dynlibdata.extend_from_slice(&jmprel);
 
     let mut dynamic = Vec::new();
     dyn_entry(&mut dynamic, DT_SCE_SYMTAB, symtab_offset);
     dyn_entry(&mut dynamic, DT_SCE_SYMTABSZ, symtab_size);
     dyn_entry(&mut dynamic, DT_SCE_SYMENT, 24);
+    dyn_entry(&mut dynamic, DT_SCE_RELA, rela_offset);
+    dyn_entry(&mut dynamic, DT_SCE_RELASZ, rela_size);
+    dyn_entry(&mut dynamic, DT_SCE_RELAENT, 24);
+    dyn_entry(&mut dynamic, DT_SCE_JMPREL, jmprel_offset);
+    dyn_entry(&mut dynamic, DT_SCE_PLTRELSZ, jmprel_size);
     dyn_entry(
         &mut dynamic,
         DT_SCE_MODULE_INFO,
@@ -145,11 +183,15 @@ fn elf_header(phoff: u64, phnum: u16) -> Vec<u8> {
 }
 
 fn program_header(p_type: u32, p_offset: u64, p_filesz: u64) -> Vec<u8> {
+    program_header_at(p_type, p_offset, p_filesz, 0)
+}
+
+fn program_header_at(p_type: u32, p_offset: u64, p_filesz: u64, p_vaddr: u64) -> Vec<u8> {
     let mut ph = Vec::new();
     ph.extend_from_slice(&p_type.to_le_bytes());
     ph.extend_from_slice(&4u32.to_le_bytes()); // p_flags = PF_R
     ph.extend_from_slice(&p_offset.to_le_bytes());
-    ph.extend_from_slice(&0u64.to_le_bytes()); // p_vaddr
+    ph.extend_from_slice(&p_vaddr.to_le_bytes());
     ph.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
     ph.extend_from_slice(&p_filesz.to_le_bytes());
     ph.extend_from_slice(&p_filesz.to_le_bytes()); // p_memsz
@@ -159,16 +201,19 @@ fn program_header(p_type: u32, p_offset: u64, p_filesz: u64) -> Vec<u8> {
 
 fn raw_elf() -> Vec<u8> {
     let (dynamic, dynlibdata) = segments();
-    let dynamic_at = 256u64;
+    let load_at = 256u64;
+    let dynamic_at = 512u64;
     let dynlibdata_at = 1024u64;
 
-    let mut file = elf_header(64, 2);
+    let mut file = elf_header(64, 3);
+    file.extend(program_header_at(PT_LOAD, load_at, LOAD_SIZE, 0));
     file.extend(program_header(PT_DYNAMIC, dynamic_at, dynamic.len() as u64));
     file.extend(program_header(
         PT_SCE_DYNLIBDATA,
         dynlibdata_at,
         dynlibdata.len() as u64,
     ));
+    file.resize((load_at + LOAD_SIZE) as usize, 0);
     file.resize(dynamic_at as usize, 0);
     file.extend_from_slice(&dynamic);
     file.resize(dynlibdata_at as usize, 0);
@@ -251,7 +296,7 @@ fn reads_the_dynamic_segment_of_a_raw_elf() {
     assert!(!image.is_self());
 
     let dynamic = image.dynamic().unwrap();
-    assert_eq!(dynamic.entries.len(), 9);
+    assert_eq!(dynamic.entries.len(), 14);
     assert_eq!(dynamic.symbols.len(), 4);
 
     let this = &dynamic.export_modules[0];
@@ -326,4 +371,93 @@ fn errors_on_an_image_without_a_dynamic_segment() {
         image.dynamic().unwrap_err(),
         Error::MissingSegment("PT_DYNAMIC")
     ));
+}
+
+const LOAD_BASE: u64 = 0x40_0000;
+
+#[test]
+fn applies_relocations_against_a_load_base() {
+    let image = Image::parse(raw_elf()).unwrap();
+    let dynamic = image.dynamic().unwrap();
+    assert_eq!(dynamic.relocations.len(), 3);
+    assert_eq!(dynamic.plt_relocations.len(), 1);
+
+    let mut loaded = image.load(LOAD_BASE).unwrap();
+    assert_eq!(loaded.data.len(), LOAD_SIZE as usize);
+
+    // Nothing supplies external addresses, so the one genuine import is left
+    // for a linker to fill in.
+    let report = loaded.relocate(&dynamic, |_| None).unwrap();
+    assert_eq!(report.applied, 2);
+    assert_eq!(report.skipped_total(), 1);
+    assert_eq!(report.skipped.get(&R_X86_64_DTPMOD64), Some(&1));
+
+    assert_eq!(report.unresolved.len(), 1);
+    let unresolved = &report.unresolved[0];
+    assert_eq!(unresolved.symbol.as_ref().unwrap().nid, IMPORT_NID);
+    assert_eq!(unresolved.name, format!("{IMPORT_NID}#A#A"));
+
+    // R_X86_64_RELATIVE: base + addend, no symbol involved.
+    assert_eq!(
+        loaded.read_u64(0x00).unwrap(),
+        LOAD_BASE + RELATIVE_ADDEND as u64
+    );
+    // R_X86_64_GLOB_DAT against a symbol this image defines: base + st_value.
+    assert_eq!(loaded.read_u64(0x10).unwrap(), LOAD_BASE + 0x1000);
+    // The unresolved JUMP_SLOT slot is left exactly as it was.
+    assert_eq!(loaded.read_u64(0x08).unwrap(), 0);
+}
+
+#[test]
+fn imports_go_through_the_supplied_resolver() {
+    let image = Image::parse(raw_elf()).unwrap();
+    let dynamic = image.dynamic().unwrap();
+    let mut loaded = image.load(LOAD_BASE).unwrap();
+
+    let mut asked = Vec::new();
+    let report = loaded
+        .relocate(&dynamic, |sym| {
+            asked.push(sym.clone());
+            Some(0xdead_0000)
+        })
+        .unwrap();
+
+    // Only the import is asked about; the locally defined symbol is not.
+    assert_eq!(asked, vec![expected_import()]);
+    assert_eq!(report.applied, 3);
+    assert!(report.unresolved.is_empty());
+    assert_eq!(loaded.read_u64(0x08).unwrap(), 0xdead_0000);
+}
+
+#[test]
+fn relocation_targets_are_bounds_checked() {
+    let image = Image::parse(raw_elf()).unwrap();
+    let dynamic = image.dynamic().unwrap();
+    // An image laid out with no room for the relocation targets must error
+    // rather than write out of bounds.
+    let mut empty = image.load(LOAD_BASE).unwrap();
+    empty.data.truncate(4);
+    assert!(matches!(
+        empty.relocate(&dynamic, |_| None).unwrap_err(),
+        Error::OutOfBounds { .. }
+    ));
+}
+
+#[test]
+fn compat_report_counts_unimplemented_imports() {
+    let image = Image::parse(raw_elf()).unwrap();
+
+    let nothing = ImplementedNids::new();
+    let report = image.compat_report(&nothing).unwrap();
+    assert_eq!(report.total(), 1);
+    assert_eq!(report.missing_count(), 1);
+    assert_eq!(report.missing, vec![expected_import()]);
+    assert_eq!(report.coverage(), 0.0);
+
+    let everything: ImplementedNids = [IMPORT_NID].into_iter().collect();
+    let report = image.compat_report(&everything).unwrap();
+    assert_eq!(report.total(), 1);
+    assert_eq!(report.missing_count(), 0);
+    assert_eq!(report.implemented(), 1);
+    assert_eq!(report.coverage(), 1.0);
 }

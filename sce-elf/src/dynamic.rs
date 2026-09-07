@@ -128,6 +128,22 @@ pub const STT_SCE: u8 = 11;
 /// The size of one `Elf64_Sym`, and the expected `DT_SCE_SYMENT`.
 pub const SYMBOL_SIZE: u64 = 24;
 
+/// The size of one `Elf64_Rela`, and the expected `DT_SCE_RELAENT`.
+pub const RELOCATION_SIZE: u64 = 24;
+
+pub const R_X86_64_NONE: u32 = 0;
+/// Direct 64-bit: `symbol + addend`.
+pub const R_X86_64_64: u32 = 1;
+pub const R_X86_64_GLOB_DAT: u32 = 6;
+/// Creates a PLT entry.
+pub const R_X86_64_JUMP_SLOT: u32 = 7;
+/// Adjust by program base: `base + addend`, no symbol involved.
+pub const R_X86_64_RELATIVE: u32 = 8;
+/// TLS module id. Everything below is TLS and needs a `PT_TLS` image.
+pub const R_X86_64_DTPMOD64: u32 = 16;
+pub const R_X86_64_DTPOFF64: u32 = 17;
+pub const R_X86_64_TPOFF64: u32 = 18;
+
 #[derive(BinRead, Debug, Clone, Copy)]
 #[br(little)]
 pub struct Symbol {
@@ -273,6 +289,10 @@ pub struct Dynamic {
     pub export_libs: Vec<LibraryInfo>,
     /// `DT_SCE_IMPORT_LIB` — the libraries this module pulls symbols from.
     pub import_libs: Vec<LibraryInfo>,
+    /// `DT_SCE_RELA`, sliced by `DT_SCE_RELAENT`.
+    pub relocations: Vec<Relocation>,
+    /// `DT_SCE_JMPREL`, sized by `DT_SCE_PLTRELSZ` — the PLT/GOT slots.
+    pub plt_relocations: Vec<Relocation>,
 }
 
 impl Dynamic {
@@ -289,6 +309,11 @@ impl Dynamic {
         let mut sym_off = None;
         let mut sym_sz = None;
         let mut sym_ent = None;
+        let mut rela_off = None;
+        let mut rela_sz = None;
+        let mut rela_ent = None;
+        let mut jmprel_off = None;
+        let mut jmprel_sz = None;
         for entry in &entries {
             match DynTag::from(entry.d_tag) {
                 DynTag::SceStrTab => str_off = Some(entry.d_val),
@@ -296,6 +321,11 @@ impl Dynamic {
                 DynTag::SceSymTab => sym_off = Some(entry.d_val),
                 DynTag::SceSymTabSz => sym_sz = Some(entry.d_val),
                 DynTag::SceSymEnt => sym_ent = Some(entry.d_val),
+                DynTag::SceRela => rela_off = Some(entry.d_val),
+                DynTag::SceRelaSz => rela_sz = Some(entry.d_val),
+                DynTag::SceRelaEnt => rela_ent = Some(entry.d_val),
+                DynTag::SceJmpRel => jmprel_off = Some(entry.d_val),
+                DynTag::ScePltRelSz => jmprel_sz = Some(entry.d_val),
                 _ => {}
             }
         }
@@ -329,9 +359,28 @@ impl Dynamic {
             _ => Vec::new(),
         };
 
+        // Both tables use DT_SCE_RELAENT as their stride; DT_SCE_PLTREL only
+        // says the PLT table is DT_RELA-shaped, which is the sole form
+        // shadPS4 has ever seen in the wild.
+        let stride = rela_ent.unwrap_or(RELOCATION_SIZE);
+        let relocations = match (rela_off, rela_sz) {
+            (Some(offset), Some(size)) => {
+                read_relocations(dynlibdata, "DT_SCE_RELA", offset, size, stride)?
+            }
+            _ => Vec::new(),
+        };
+        let plt_relocations = match (jmprel_off, jmprel_sz) {
+            (Some(offset), Some(size)) => {
+                read_relocations(dynlibdata, "DT_SCE_JMPREL", offset, size, stride)?
+            }
+            _ => Vec::new(),
+        };
+
         let mut this = Self {
             str_table,
             symbols,
+            relocations,
+            plt_relocations,
             ..Default::default()
         };
 
@@ -390,11 +439,25 @@ impl Dynamic {
         self.linkable_symbols(true)
     }
 
+    /// Decodes one symbol's `NID#library#module` name, resolving the encoded
+    /// library and module ids to their names. Returns `None` for names that
+    /// aren't in that form — ordinary local names, debug entries.
+    pub fn decode_symbol(&self, sym: &Symbol) -> Option<DynSymbol> {
+        let name = self.string(sym.st_name as u64).ok()?;
+        let (nid, lib_id, mod_id) = split_encoded_name(&name)?;
+        Some(DynSymbol {
+            module: self.module_name(mod_id),
+            library: self.library_name(lib_id),
+            nid: nid.to_owned(),
+            kind: sym.kind(),
+        })
+    }
+
     /// Per shadPS4's `Module::LoadSymbols`: only `STB_GLOBAL`/`STB_WEAK`
     /// functions and objects take part in linking, and a symbol is an export
     /// exactly when `st_value` is non-zero. Symbols whose name isn't in the
-    /// `NID#library#module` form (ordinary local names, debug entries) are
-    /// skipped the same way the reference implementation skips them.
+    /// `NID#library#module` form are skipped the same way the reference
+    /// implementation skips them.
     fn linkable_symbols(&self, exports: bool) -> Vec<DynSymbol> {
         self.symbols
             .iter()
@@ -410,14 +473,7 @@ impl Dynamic {
                 if exports != (sym.st_value != 0) {
                     return None;
                 }
-                let name = self.string(sym.st_name as u64).ok()?;
-                let (nid, lib_id, mod_id) = split_encoded_name(&name)?;
-                Some(DynSymbol {
-                    module: self.module_name(mod_id),
-                    library: self.library_name(lib_id),
-                    nid: nid.to_owned(),
-                    kind,
-                })
+                self.decode_symbol(sym)
             })
             .collect()
     }
@@ -472,6 +528,30 @@ fn read_entries(dynamic: &[u8]) -> Result<Vec<DynEntry>> {
         entries.push(entry);
     }
     Ok(entries)
+}
+
+fn read_relocations(
+    dynlibdata: &[u8],
+    what: &'static str,
+    offset: u64,
+    size: u64,
+    stride: u64,
+) -> Result<Vec<Relocation>> {
+    if stride < RELOCATION_SIZE {
+        return Err(Error::BadEntrySize {
+            what: "DT_SCE_RELAENT",
+            size: stride,
+            minimum: RELOCATION_SIZE,
+        });
+    }
+    let bytes = sub_slice(dynlibdata, what, offset, size)?;
+    let mut cursor = Cursor::new(bytes);
+    (0..size / stride)
+        .map(|i| {
+            cursor.seek(SeekFrom::Start(i * stride))?;
+            Ok(Relocation::read(&mut cursor)?)
+        })
+        .collect()
 }
 
 fn sub_slice<'a>(

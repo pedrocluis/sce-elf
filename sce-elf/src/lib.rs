@@ -5,17 +5,21 @@
 //! hashing. See [`Image::imports`] for the imported `(module, library, nid)`
 //! triples and [`nid::hash`] for symbol-name-to-NID hashing.
 
+pub mod compat;
 pub mod dynamic;
 pub mod elf;
 pub mod error;
+pub mod load;
 pub mod nid;
 pub mod self_file;
 
+pub use compat::{CompatReport, ImplementedNids};
 pub use dynamic::{
     DynEntry, DynSymbol, DynTag, Dynamic, LibraryInfo, ModuleInfo, Relocation, Symbol,
 };
 pub use elf::{ElfHeader, ElfType, ProgramHeader, ProgramType};
 pub use error::{Error, Result};
+pub use load::{LoadedImage, RelocationReport, UnresolvedSymbol};
 pub use self_file::{SelfHeader, SelfSegmentHeader};
 
 use binrw::BinRead;
